@@ -1,17 +1,62 @@
 """Staircase attention mask for Block Diffusion.
 
-The staircase mask is the key innovation of Block Diffusion (BD3-LMs) that enables
-KV-caching while preventing label leakage.
+Architecture Overview
+====================
 
-Input is concatenated: [x_t || x_0] — noisy half followed by clean half (2L total).
+    seq_len = 64, block_size = 8  →  n_blocks = 8
+           |
+           v
+    Input is concatenated: [x_t || x_0]     (2L = 128 tokens)
+           |                              x_t = noisy half (left)
+           |                              x_0 = clean half (right)
+           v
+    +----------------------------------------------------+
+    |                 Staircase Mask                       |
+    |                 Shape: (2L, 2L) = (128, 128)         |
+    +----------------------------------------------------+
+           |
+           v
+    +----------------------------------------------------+
+    |  Noisy Half (rows 0:L)                              |
+    |  ─────────────────────────────────────────────────  |
+    |  Block i can attend to:                              |
+    |    • Noisy tokens in block i (bidirectional)         |
+    |    • Clean tokens in blocks < i (block-causal)      |
+    +----------------------------------------------------+
+           |
+           v
+    +----------------------------------------------------+
+    |  Clean Half (rows L:2L)                             |
+    |  ─────────────────────────────────────────────────  |
+    |  Block i can attend to:                              |
+    |    • Clean tokens in blocks ≤ i (block-causal)      |
+    |    • NO clean tokens in block i (no label leakage!) |
+    +----------------------------------------------------+
 
-Mask components:
-- M_BD (Block-Diagonal): Same half within same block attends bidirectionally
-- M_OBC (Offset Block-Causal): Noisy queries attend to clean keys from STRICTLY earlier blocks
-- M_BC (Block-Causal): Clean queries attend to clean keys from current/earlier blocks
 
-Critical constraint: NO label leakage — noisy block i must NOT see clean tokens from block i.
-This uses STRICT inequality (>) for block comparison, not >=.
+Mask Matrix Visualization (L=16, block_size=4, 4 blocks)
+============================================================
+
+    0   4   8   12  16  20  24  28  32  36  40  44  48  52  56  60  64  68  72  76  80  84  88  92  96  100 104 108 112 116 120 124 128
+    |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |   |
+    ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼   ▼
+ 0 ┌───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬───┬─────────┬───────┬───────┬───────┬───────┐
+   │ B │ B │ B │ B │   │   │   │   │   │   │   │   │   │   │   │   │   OBC   │ OBC   │ OBC   │ OBC   │ OBC   │
+ 4 ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼─────────┼───────┼───────┼───────┼───────┤
+   │   │ B │ B │ B │ B │   │   │   │   │   │   │   │   │   │   │   │   OBC   │ OBC   │ OBC   │ OBC   │ OBC   │
+ 8 ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼─────────┼───────┼───────┼───────┼───────┤
+   │   │   │ B │ B │ B │ B │   │   │   │   │   │   │   │   │   │   │   OBC   │ OBC   │ OBC   │ OBC   │ OBC   │
+12 ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼─────────┼───────┼───────┼───────┼───────┤
+   │   │   │   │ B │ B │ B │ B │   │   │   │   │   │   │   │   │   OBC   │ OBC   │ OBC   │ OBC   │ OBC   │
+16 ├───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼───┼─────────┼───────┼───────┼───────┼───────┤
+   │   │   │   │   │ BC│ BC│ BC│ BC│   │   │   │   │   │   │   │         │       │       │       │       │
+   ... (clean half follows same pattern, but NO self-attention to own block's clean half)
+
+
+Legend:
+    B  = Block-diagonal (bidirectional within block)
+    OBC = Offset block-causal (noisy → clean from earlier blocks)
+    BC  = Block-causal (clean → clean from current/earlier blocks)
 """
 
 import torch
@@ -20,22 +65,34 @@ import torch
 class StaircaseMask:
     """Build staircase attention masks for Block Diffusion.
 
+    The staircase mask enforces three key constraints:
+    1. Within-block bidirectional: tokens in same block can attend to each other
+    2. Block-causal: blocks can only attend to earlier blocks (AR ordering)
+    3. No label leakage: noisy block i cannot see clean tokens from block i
+
     Args:
         block_size: Number of tokens per block (L' in BD3-LMs paper)
-        seq_len: Length of the original sequence (L)
+        seq_len: Length of the original sequence (L). Must be divisible by block_size.
     """
 
     def __init__(self, block_size: int, seq_len: int):
         self.block_size = block_size
         self.seq_len = seq_len
         self.n_blocks = seq_len // block_size
-        assert seq_len % block_size == 0, "seq_len must be divisible by block_size"
+        assert seq_len % block_size == 0, \
+            f"seq_len={seq_len} must be divisible by block_size={block_size}"
 
     def build(self) -> torch.Tensor:
         """Build the full staircase attention mask (2L x 2L).
 
-        Returns:
-            mask: (2*seq_len, 2*seq_len) — True means attention is ALLOWED
+        Input:  seq_len=L, block_size=B  →  n_blocks=L//B
+        Output: mask: (2L, 2L)  —  True = attention allowed, False = blocked
+
+        The mask is organized as:
+            [0:L,   0:L]   → Noisy queries → Noisy keys (block-diagonal)
+            [0:L,   L:2L]  → Noisy queries → Clean keys (offset block-causal)
+            [L:2L,  0:L]   → Clean queries → Noisy keys (unused, not needed for generation)
+            [L:2L,  L:2L]  → Clean queries → Clean keys (block-causal, no self)
         """
         L = self.seq_len
         mask = torch.zeros(2 * L, 2 * L, dtype=torch.bool)
@@ -47,21 +104,17 @@ class StaircaseMask:
             # === Noisy half (rows 0:L) ===
 
             # M_BD: Noisy queries attend bidirectionally within same block
-            # Noisy block b → Noisy block b (within-block bidirectional)
+            # Block b noisy → Block b noisy (within-block bidirectional)
             mask[b_start:b_end, b_start:b_end] = True
 
             # M_OBC: Noisy block b attends to CLEAN keys from STRICTLY earlier blocks
-            # Noisy block b → Clean block < b
+            # Noisy block b → Clean blocks 0..b-1
             for prev_b in range(b):
                 noisy_start = b_start
                 noisy_end = b_end
                 clean_start = prev_b * self.block_size + L
                 clean_end = clean_start + self.block_size
                 mask[noisy_start:noisy_end, clean_start:clean_end] = True
-
-            # M_OBC: Noisy block b attends to CLEAN keys from its OWN block
-            # BUT only to positions AFTER current position (within-block AR)
-            # This is handled by the per-position causal mask within the block
 
             # === Clean half (rows L:2L) ===
 
@@ -74,23 +127,16 @@ class StaircaseMask:
                 clean_key_end = clean_key_start + self.block_size
                 mask[clean_query_start:clean_query_end, clean_key_start:clean_key_end] = True
 
+            # NOTE: We do NOT add self-attention from clean block b to clean block b
+            # This is the "no label leakage" constraint — critical for training!
+
         return mask
 
-    def build_causal_within_block(self) -> torch.Tensor:
-        """Build a causal (lower-triangular) mask for within-block AR generation.
+    def to_block_mask(self) -> torch.Tensor:
+        """Convert to a FlexAttention-compatible BlockMask or dense float tensor.
 
-        Returns:
-            causal_mask: (seq_len, seq_len) — True means attention is ALLOWED
-        """
-        L = self.seq_len
-        causal = torch.tril(torch.ones(L, L, dtype=torch.bool))
-        return causal
-
-    def to_block_mask(self):
-        """Convert to a FlexAttention-compatible BlockMask or dense tensor.
-
-        For now returns a dense float mask (1.0 = attend, 0.0 = don't attend).
-        Can be upgraded to FlexAttention BlockMask for efficiency.
+        Input:  self.build() → bool mask (2L, 2L)
+        Output: float mask (2L, 2L) — 1.0 = attend, 0.0 = don't attend
         """
         bool_mask = self.build()
-        return bool_mask.float()  # Dense mask for now
+        return bool_mask.float()

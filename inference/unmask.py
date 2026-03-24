@@ -1,8 +1,43 @@
 """Confidence-based unmasking strategies for Block Diffusion inference.
 
-During denoising, we iteratively unmask tokens from most confident to least confident.
-This gives a natural prioritization: high-confidence predictions are committed early,
-while low-confidence positions benefit from more denoising steps.
+Architecture Overview
+====================
+
+    During denoising, we iteratively unmask tokens from most confident to least.
+    This gives a natural prioritization: high-confidence predictions committed early,
+    while low-confidence positions benefit from more denoising steps.
+
+    Step 0:
+        block = [M, M, M, M, M, M, M, M]     M = masked
+        conf  = [0.1, 0.9, 0.3, 0.7, 0.5, 0.2, 0.4, 0.6]
+               │
+               ▼
+        unmask_top_k(masked, conf, k=3)
+               │
+               ▼
+        Step 1:
+        block = [M, T, M, T, T, M, M, M]     T = token revealed
+        conf  = [0.1,  ---, 0.3, ---, ---, 0.2, 0.4, 0.6]
+               │
+               ▼
+        unmask_top_k(masked, conf, k=3)
+               │
+               ▼
+        Step 2:
+        block = [M, T, M, T, T, M, T, T]
+               │
+               ▼
+        unmask_top_k(masked, conf, k=2)
+               │
+               ▼
+        Final:
+        block = [T, T, T, T, T, T, T, T]
+
+
+Key Functions:
+- unmask_top_k: unmask positions with highest confidence
+- unmask_by_threshold: unmask positions exceeding confidence threshold
+- uniform_schedule: evenly distribute unmasking across steps
 """
 
 import torch
@@ -15,16 +50,26 @@ def unmask_top_k(
 ) -> torch.Tensor:
     """Unmask the k positions with highest confidence.
 
-    Positions that are already unmasked (False in masked) stay unmasked.
-    Only masked (True) positions can become unmasked.
+    Positions that are already unmasked (masked=False) stay unmasked.
+    Only masked (masked=True) positions can become unmasked.
 
-    Args:
-        masked: (batch, seq_len) or (seq_len,) — True means position is currently masked
-        confidences: (batch, seq_len) or (seq_len,) — confidence scores per position
-        k: number of positions to unmask
+    Data Flow:
+    ──────────
+    Input:
+        masked:      torch.Tensor — shape (B, L) or (L,) — True = masked
+        confidences: torch.Tensor — shape (B, L) or (L,) — per-position confidence
+        k:           int — number of positions to unmask
 
-    Returns:
-        new_mask: same shape as masked — True means position is still masked
+    Output:
+        torch.Tensor — same shape as masked — True = still masked, False = unmasked
+
+    Example:
+        masked =      [True,  True,  True,  True,  True, False, False, False, False, False]
+        confidences = [0.1,   0.9,   0.3,   0.7,   0.5,  -1.0,  -1.0,  -1.0,  -1.0,  -1.0]
+        k = 3
+        ─────────────────────────────────────────────
+        Result:       [True,  False, True,  False, False, False, False, False, False, False]
+        (positions 1, 3, 4 have highest confidences → unmasked)
     """
     # Handle 1D tensors (single sequence)
     if masked.dim() == 1:
@@ -78,15 +123,25 @@ def unmask_by_threshold(
 ) -> torch.Tensor:
     """Unmask positions where confidence exceeds threshold.
 
-    Args:
-        masked: (batch, seq_len) — True means position is currently masked
-        confidences: (batch, seq_len) — confidence scores per position
-        threshold: minimum confidence to unmask
+    Data Flow:
+    ──────────
+    Input:
+        masked:      torch.Tensor — shape (B, L) or (L,) — True = masked
+        confidences: torch.Tensor — shape (B, L) or (L,) — per-position confidence
+        threshold:   float — minimum confidence to unmask
 
-    Returns:
-        new_mask: (batch, seq_len) — True means position is still masked
+    Output:
+        torch.Tensor — same shape — True = still masked, False = unmasked
+
+    Example:
+        masked =      [True,  True,  True,  True,  True]
+        confidences = [0.1,   0.9,   0.3,   0.7,   0.5]
+        threshold =  0.6
+        ─────────────────────────────────────────────
+        Result:       [True,  False, True,  False, True]
+        (positions 1 and 3 exceed threshold → unmasked)
     """
-    # Only consider masked positions
+    # Set unmasked positions to -inf so they're never considered
     eligible = masked & (confidences >= threshold)
     return masked & ~eligible
 
@@ -98,13 +153,22 @@ def uniform_schedule(
 ) -> int:
     """Uniform unmasking schedule: unmask equal number of tokens per step.
 
-    Args:
-        n_masked: total number of masked positions
-        step: current denoising step (0-indexed)
-        total_steps: total number of denoising steps
+    Data Flow:
+    ──────────
+    Input:
+        n_masked:    int — total number of masked positions
+        step:        int — current denoising step (0-indexed)
+        total_steps: int — total number of denoising steps
 
-    Returns:
-        number of positions to unmask at this step
+    Output:
+        int — number of positions to unmask at this step
+
+    Example:
+        n_masked = 10, total_steps = 4
+        step=0 → 2    (min 2, 10//4=2)
+        step=1 → 2
+        step=2 → 2
+        step=3 → 4    (last step: take remainder = 10 - 2*3)
     """
     if step >= total_steps - 1:
         return n_masked  # Last step: unmask everything remaining

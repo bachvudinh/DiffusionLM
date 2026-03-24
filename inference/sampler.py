@@ -1,12 +1,40 @@
 """Gumbel-max sampling for discrete token generation.
 
-Gumbel-max sampling provides a differentiable way to sample from a categorical
-distribution by adding Gumbel noise to logits:
-    gumbel = -log(-log(uniform(0,1)))
-    sample = argmax(logits + gumbel)
+Architecture Overview
+====================
 
-This is equivalent to sampling from softmax(logits) but gives us a continuous
-relaxation for gradient flow during training.
+    logits                                    (B, L, V)
+      |                                        B=batch, L=seq_len, V=vocab_size
+      v
+    +------------------------+
+    | Softmax (optional)      |  probs = softmax(logits, dim=-1)
+    +------------------------+
+      |
+      v
+    +------------------------+
+    | Gumbel Noise            |  gumbel = (-log(-log(uniform))) ^ temperature
+    +------------------------+
+      |
+      v
+    logits_exp / gumbel         (B, L, V)
+      |
+      v
+    +------------------------+
+    | Argmax                  |  samples = argmax(..., dim=-1)
+    +------------------------+
+      |
+      v
+    samples                              (B, L)  — token indices
+
+
+Key Properties:
+- temperature=0 → pure argmax (greedy)
+- temperature=1 → standard Gumbel-max
+- temperature→∞ → approaches uniform sampling
+
+Gumbel-max provides differentiable sampling:
+    sample ~ softmax(logits + gumbel)
+    This gives gradients wrt logits even at discrete choices.
 """
 
 import torch
@@ -25,11 +53,15 @@ class GumbelSampler:
     def sample(self, logits: torch.Tensor) -> torch.Tensor:
         """Sample tokens from logits using Gumbel-max.
 
-        Args:
-            logits: (batch, seq_len, vocab_size) — unnormalized log probabilities
+        Input:
+            logits: torch.Tensor — shape (B, L, V)
+                B = batch size
+                L = sequence length
+                V = vocabulary size
 
-        Returns:
-            samples: (batch, seq_len) — sampled token indices
+        Output:
+            torch.Tensor — shape (B, L)
+                sampled token indices in [0, V-1]
         """
         if self.temperature == 0:
             return torch.argmax(logits, dim=-1)
@@ -45,11 +77,12 @@ class GumbelSampler:
     def probabilities(self, logits: torch.Tensor) -> torch.Tensor:
         """Compute softmax probabilities from logits.
 
-        Args:
-            logits: (batch, seq_len, vocab_size)
+        Input:
+            logits: torch.Tensor — shape (B, L, V)
 
-        Returns:
-            probs: (batch, seq_len, vocab_size) — softmax probabilities
+        Output:
+            torch.Tensor — shape (B, L, V)
+                softmax probabilities per token
         """
         return torch.softmax(logits.float(), dim=-1)
 
@@ -58,12 +91,13 @@ class GumbelSampler:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Sample tokens and return confidence (probability of sampled token).
 
-        Args:
-            logits: (batch, seq_len, vocab_size)
+        Input:
+            logits: torch.Tensor — shape (B, L, V)
 
-        Returns:
-            samples: (batch, seq_len) — sampled token indices
-            confidence: (batch, seq_len) — probability of sampled token
+        Output:
+            samples: torch.Tensor — shape (B, L)
+            confidence: torch.Tensor — shape (B, L)
+                confidence[i] = prob[ samples[i] ]  (probability of chosen token)
         """
         probs = self.probabilities(logits)
         samples = torch.argmax(probs, dim=-1)

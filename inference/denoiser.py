@@ -1,12 +1,103 @@
 """Block denoiser: orchestrates the per-block denoising loop.
 
-Block Diffusion generates one block at a time (left-to-right, AR).
-Within each block, it runs T denoising steps to progressively unmask tokens.
+Architecture Overview
+====================
 
-Key components:
-1. Initialize block: prompt remainder (if any) + [MASK] tokens
-2. Denoise loop: for each step, run model forward, compute confidences, unmask top-k
-3. Commit: after all steps, cache KV for this block
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │                    Block Denoising (per block)                       │
+    │                                                                      │
+    │  Input:                                                              │
+    │    • prompt_remainder: N tokens from prompt at block start           │
+    │    • rest of block: filled with [MASK] tokens                       │
+    │                                                                      │
+    │  ┌──────────────────────────────────────────────────────────────┐   │
+    │  │              Denoise Loop (denoise_steps iterations)           │   │
+    │  │                                                               │   │
+    │  │   block, masked ──► model ──► logits ──► Gumbel sample         │   │
+    │  │       ▲               │             │                         │   │
+    │  │       │               ▼             ▼                         │   │
+    │  │       │         (B, block_size, V)  confidences                │   │
+    │  │       │               │             │                         │   │
+    │  │       │               ▼             ▼                         │   │
+    │  │       │         unmask_top_k ──► new_masked                    │   │
+    │  │       │               │             │                         │   │
+    │  │       └───────────────┴─────────────┘                         │   │
+    │  │                      │                                         │   │
+    │  │                      ▼                                         │   │
+    │  │               block = where(new_masked=False, samples, block)  │   │
+    │  └──────────────────────────────────────────────────────────────┘   │
+    │                              │                                     │
+    │                              ▼                                     │
+    │  Output:                                                             │
+    │    • final_block: (1, block_size) — fully denoised                  │
+    │    • new_tokens: list[int] — generated token IDs                     │
+    └─────────────────────────────────────────────────────────────────────┘
+
+
+Block Initialization (init_block)
+================================
+
+    prompt_remainder = 3, block_size = 8
+
+    Before:
+        [token_0, token_1, token_2, M, M, M, M, M]
+                         └─ 3 ─┘└──── 5 ────┘
+                       prompt   masks
+
+    After init_block:
+        block  = [token_0, token_1, token_2, 0,    0,    0,    0,    0   ]
+                             (mask_token_id=0)
+        masked = [False,   False,   False,   True, True, True, True, True]
+
+
+Denoise Step Data Flow
+=======================
+
+    Step s, block=(1, 8), masked=(1, 8)
+
+        masked = [False, False, False,  True,  True,  True,  True,  True]
+        block  = [token_0, token_1, token_2, M,    M,    M,    M,    M   ]
+
+                          │
+                          ▼
+                   model(block)
+                          │
+                          ▼
+                   logits: (1, 8, V)   — V = vocab_size
+                          │
+                          ▼
+                   ┌─────────────┐
+                   │ Suppress     │  mask_token_id → -inf
+                   │ MASK/PAD    │  pad_token_id → -inf
+                   └─────────────┘
+                          │
+                          ▼
+                   logits: (1, 8, V)   — -inf at special token positions
+                          │
+                          ▼
+                   GumbelSampler(temperature)
+                          │
+                          ▼
+                   samples: (1, 8)   — sampled token IDs
+                          │
+                          ▼
+                   probs = softmax(logits, dim=-1)
+                   confidences = gather(probs, samples) → (1, 8)
+                          │
+                          ▼
+                   confidences = [?, ?, ?, 0.3, 0.8, 0.5, 0.6, 0.4]
+                          │
+                          ▼
+                   unmask_top_k(masked, confidences, k=3)
+                          │
+                          ▼
+                   new_masked = [False, False, False, True, False, True, False, True]
+                          │
+                          ▼
+                   block = where(new_masked == False, samples, block)
+                          │
+                          ▼
+                   block = [token_0, token_1, token_2, token_4, M, token_6, M, M]
 """
 
 import torch
@@ -19,7 +110,7 @@ from .unmask import unmask_top_k, uniform_schedule
 class BlockDenoiser:
     """Handles per-block denoising for Block Diffusion generation.
 
-    Args:
+    Attributes:
         block_size: Number of tokens per block
         mask_token_id: Token ID for [MASK]
         pad_token_id: Token ID for padding
@@ -51,12 +142,15 @@ class BlockDenoiser:
     def init_block(self, prompt_remainder: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
         """Initialize a block: prompt remainder + [MASK] tokens.
 
-        Args:
-            prompt_remainder: Number of prompt tokens at the start of this block
+        Input:
+            prompt_remainder: int — number of prompt tokens at start of block (0 to block_size)
 
-        Returns:
-            block: (1, block_size) — initialized block with mask tokens
-            masked: (1, block_size) — True for masked positions
+        Output:
+            block:  torch.Tensor — shape (1, block_size)
+                    First prompt_remainder positions = prompt tokens (not masked)
+                    Rest = mask_token_id
+            masked: torch.Tensor — shape (1, block_size)
+                    True = masked (needs denoising), False = already known
         """
         block = torch.full(
             (1, self.block_size),
@@ -79,15 +173,15 @@ class BlockDenoiser:
 
         Uses uniform schedule: equal tokens per step, last step takes remainder.
 
-        Args:
-            t: current timestep (1.0 = no noise, 0.0 = fully masked)
-            s: next timestep
-            n_masked: number of currently masked positions
-            step: current step index
-            total_steps: total denoising steps
+        Input:
+            t:          float — current timestep (1.0 = no noise, 0.0 = fully masked)
+            s:          float — next timestep
+            n_masked:   int   — number of currently masked positions
+            step:       int   — current step index (0-indexed)
+            total_steps: int  — total denoising steps
 
-        Returns:
-            number of positions to unmask this step
+        Output:
+            int — number of positions to unmask at this step
         """
         if step >= total_steps - 1:
             return n_masked
@@ -103,16 +197,16 @@ class BlockDenoiser:
     ) -> tuple[torch.Tensor, list[int]]:
         """Run the full denoising loop for one block.
 
-        Args:
-            model: The language model (with forward(x, pos_offset) -> logits)
-            block: (1, block_size) — current block state
-            masked: (1, block_size) — True for masked positions
-            pos_offset: Position offset for RoPE
-            logits_callback: function(model, block, pos_offset) -> (logits, extra)
+        Input:
+            model:          object — language model with forward(x, pos_offset) → (logits, _)
+            block:          torch.Tensor — shape (1, block_size) — current block state
+            masked:         torch.Tensor — shape (1, block_size) — True for masked positions
+            pos_offset:     int — position offset for RoPE
+            logits_callback: callable — function(model, block, pos_offset) → (logits, extra)
 
-        Returns:
-            final_block: (1, block_size) — denoised block
-            new_tokens: list of newly generated token IDs (excluding prompt)
+        Output:
+            final_block: torch.Tensor — shape (1, block_size) — denoised block
+            new_tokens:  list[int] — newly generated token IDs (excluding prompt remainder)
         """
         for step in range(self.denoise_steps):
             if not masked.any():
@@ -163,12 +257,12 @@ class BlockDenoiser:
     ) -> list[int]:
         """Extract newly generated tokens from a denoised block.
 
-        Args:
-            block: (1, block_size) — denoised block
-            prompt_remainder: Number of prompt tokens at the start of this block
+        Input:
+            block:           torch.Tensor — shape (1, block_size) — denoised block
+            prompt_remainder: int — number of prompt tokens at start of block
 
-        Returns:
-            new_tokens: list of token IDs (excluding prompt remainder)
+        Output:
+            list[int] — newly generated token IDs (excluding prompt remainder)
         """
         tokens = block[0].tolist()
         return tokens[prompt_remainder:]
