@@ -1,50 +1,30 @@
-"""
-VDLLM - Block Diffusion Inference Engine.
+"""vdllm — Block Diffusion Language Model inference engine.
 
-Pure PyTorch implementation of SDAR (Synergy of Diffusion and AutoRegression)
-block diffusion model inference, optimized for Metal (Apple Silicon) and Triton (NVIDIA).
+Derived from JetEngine by Yihan Bian et al.
+Reference: https://github.com/Labman42/JetEngine
 
-Based on:
-- JetEngine SDAR: https://github.com/Jet-Astra/SDAR
-- vllm-metal: https://github.com/vllm-project/vllm-metal
+A high-performance inference engine for SDAR and SDAR-MoE block
+diffusion language models. Features include:
 
-================================================================================
-                              ARCHITECTURE
-================================================================================
+  - Paged KV cache with prefix caching (xxhash)
+  - Staircase block-local attention (Triton kernel)
+  - FlashAttention-2 for paged denoise attention
+  - CUDA graph capture/replay for denoise steps
+  - Tensor parallelism (TP) for multi-GPU inference
+  - 5 remasking strategies: sequential, low_confidence_static,
+    low_confidence_dynamic, entropy_bounded, random
+  - Fused MoE Triton kernel for sparse expert models
 
-vdllm/
-├── engine/       # Device backends (Metal, Triton, CPU)
-├── layers/       # Model layers (attention, MLP, RMSNorm, RoPE)
-├── models/       # Model implementations (SDAR)
-├── inference/    # Inference pipeline
-└── utils/        # Utilities
+Quick Start:
 
-================================================================================
-                              USAGE
-================================================================================
+    from vdllm import LLM, SamplingParams
 
-    from vdllm.models import SDARForCausalLM, SDARConfig
-    from vdllm.engine import get_backend, build_block_diffusion_mask
-
-    # Create model
-    config = SDARConfig()
-    model = SDARForCausalLM(config)
-
-    # Get compute backend
-    backend = get_backend(num_heads=32, head_dim=128)
-
-    # Build attention mask
-    mask = build_block_diffusion_mask(seq_len=1024, block_size=4)
-
+    llm = LLM("path/to/sdar-model")
+    params = SamplingParams(max_tokens=256, temperature=0.7)
+    outputs = llm.generate(["Hello, world!"], params)
 """
 
-from .models import SDARConfig, SDARModel, SDARForCausalLM
-from .engine import get_backend, get_device_name
+from vdllm.llm import LLM
+from vdllm.sampling_params import SamplingParams
 
-__all__ = [
-    "SDARConfig",
-    "SDARModel",
-    "SDARForCausalLM",
-    "get_backend",
-    "get_device_name",
-]
+__all__ = ["LLM", "SamplingParams"]

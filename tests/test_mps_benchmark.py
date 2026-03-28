@@ -10,10 +10,10 @@ Run with: python -m pytest tests/test_mps_benchmark.py -v -s
                               BENCHMARK RESULTS
 ================================================================================
 
-This module outputs TPS (Tokens Per Second) metrics for key operations:
-- Attention forward pass
-- Block diffusion mask creation
-- End-to-end block generation
+This module outputs TPS (Tokens Per Second) metrics for:
+- Model loading time
+- Token generation/inference time
+- End-to-end TPS (including model loading)
 
 ================================================================================
 """
@@ -21,6 +21,7 @@ This module outputs TPS (Tokens Per Second) metrics for key operations:
 import time
 import torch
 import pytest
+from dataclasses import dataclass
 
 
 def format_tps(time_seconds: float, num_tokens: int) -> str:
@@ -28,7 +29,39 @@ def format_tps(time_seconds: float, num_tokens: int) -> str:
     if time_seconds <= 0:
         return "inf TPS"
     tps = num_tokens / time_seconds
-    return f"{tps:.2f} TPS"
+    return f"{tps:.2f} tok/s"
+
+
+@dataclass
+class TinySDARConfig:
+    """Minimal SDAR config for fast testing."""
+    vocab_size: int = 32000
+    hidden_size: int = 512
+    intermediate_size: int = 1408
+    num_hidden_layers: int = 4
+    num_attention_heads: int = 8
+    num_key_value_heads: int = 4  # GQA
+    head_dim: int = 64
+    hidden_act: str = "silu"
+    rms_norm_eps: float = 1e-6
+    max_position_embeddings: int = 2048
+    rope_theta: float = 10000.0
+    rope_scaling: int = None
+    attention_bias: bool = False
+    attention_dropout: float = 0.0
+    use_sliding_window: bool = False
+    sliding_window: int = 4096
+    max_window_layers: int = 28
+    block_size: int = 4
+    mask_token_id: int = 151669
+    torch_dtype: str = "float32"
+    initializer_range: float = 0.02
+    use_cache: bool = True
+    tie_word_embeddings: bool = False
+
+    @property
+    def num_key_value_groups(self) -> int:
+        return self.num_attention_heads // self.num_key_value_heads
 
 
 class TestDeviceDetection:
@@ -317,59 +350,179 @@ class TestSpeedComparison:
 
 
 class TestEndToEndTPS:
-    """End-to-end TPS benchmark for block diffusion generation."""
+    """End-to-end TPS benchmark: model loading + inference."""
 
-    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
-    def test_block_generation_tps(self):
-        """Benchmark full block generation throughput."""
-        from vdllm.engine import get_backend
+    @pytest.fixture
+    def device(self):
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
 
-        backend = get_backend(num_heads=32, head_dim=128)
+    def test_model_load_time(self, device):
+        """Benchmark model instantiation/loading time."""
+        from vdllm.models import SDARForCausalLM, SDARConfig
 
-        # Simulate block diffusion parameters
+        config = SDARConfig(
+            vocab_size=32000,
+            hidden_size=512,
+            intermediate_size=1408,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=64,
+        )
+
+        # Warmup
+        _ = SDARForCausalLM(config)
+
+        # Benchmark model creation
+        iterations = 5
+        start = time.perf_counter()
+        for _ in range(iterations):
+            model = SDARForCausalLM(config)
+
+        model_creation_time = (time.perf_counter() - start) / iterations
+
+        print(f"\n[Model Creation]")
+        print(f"  Device: {device.type}")
+        print(f"  Config: {config.num_hidden_layers}L, hidden={config.hidden_size}")
+        print(f"  Avg creation time: {model_creation_time*1000:.2f}ms")
+
+    def test_forward_pass_tps(self, device):
+        """Benchmark forward pass throughput."""
+        from vdllm.models import SDARForCausalLM, SDARConfig
+
+        config = SDARConfig(
+            vocab_size=32000,
+            hidden_size=512,
+            intermediate_size=1408,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=64,
+        )
+
+        model = SDARForCausalLM(config).to(device)
+        model.eval()
+
         batch_size = 1
-        seq_len = 256
-        num_heads = 32
-        head_dim = 128
-        vocab_size = 32000
-        block_size = 4
-        denoising_steps = 4
+        seq_len = 128
+        vocab_size = config.vocab_size
 
-        # Create input tensors
-        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=backend.device)
-        positions = torch.arange(seq_len, device=backend.device).unsqueeze(0)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len), device=device)
+        positions = torch.arange(seq_len, device=device).unsqueeze(0)
 
         # Warmup
         for _ in range(3):
-            # Simulate a forward pass
-            x = torch.randn(batch_size, seq_len, num_heads * head_dim, device=backend.device)
+            with torch.no_grad():
+                _ = model(input_ids=input_ids, positions=positions)
 
-        backend.synchronize()
+        if device.type == "mps":
+            torch.mps.synchronize()
 
-        # Benchmark: simulate block generation loop
-        iterations = 10
-        tokens_generated = 0
-        t_start = time.perf_counter()
-
+        # Benchmark forward passes
+        iterations = 20
+        start = time.perf_counter()
+        tokens_processed = 0
         for _ in range(iterations):
-            # Simulate processing a block (4 denoising steps)
-            for step in range(denoising_steps):
-                x = torch.randn(batch_size, block_size, num_heads * head_dim, device=backend.device)
-                tokens_generated += block_size
+            with torch.no_grad():
+                _ = model(input_ids=input_ids, positions=positions)
+            tokens_processed += batch_size * seq_len
 
-        backend.synchronize()
-        elapsed = time.perf_counter() - t_start
+        if device.type == "mps":
+            torch.mps.synchronize()
 
-        tps = tokens_generated / elapsed if elapsed > 0 else 0
+        elapsed = time.perf_counter() - start
+        tps = tokens_processed / elapsed if elapsed > 0 else 0
 
-        print(f"\n{'='*60}")
-        print(f"[End-to-End Block Generation TPS]")
-        print(f"  Device: {backend.name}")
-        print(f"  Block size: {block_size}")
-        print(f"  Denoising steps: {denoising_steps}")
-        print(f"  Tokens generated: {tokens_generated}")
+        print(f"\n[Forward Pass TPS]")
+        print(f"  Device: {device.type}")
+        print(f"  Batch: {batch_size}, Seq Len: {seq_len}")
+        print(f"  Tokens processed: {tokens_processed}")
         print(f"  Total time: {elapsed*1000:.2f}ms")
         print(f"  Throughput: {tps:.0f} tokens/sec")
+
+    @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")
+    def test_mps_vs_cpu_end_to_end(self):
+        """Compare MPS vs CPU end-to-end: model load + forward pass."""
+        from vdllm.models import SDARForCausalLM, SDARConfig
+
+        config = SDARConfig(
+            vocab_size=32000,
+            hidden_size=512,
+            intermediate_size=1408,
+            num_hidden_layers=4,
+            num_attention_heads=8,
+            num_key_value_heads=4,
+            head_dim=64,
+        )
+
+        batch_size = 1
+        seq_len = 128
+        iterations = 10
+
+        results = {}
+
+        for device_name in ["cpu", "mps"]:
+            device = torch.device(device_name)
+
+            # Measure model loading
+            load_start = time.perf_counter()
+            model = SDARForCausalLM(config).to(device)
+            model.eval()
+            load_time = time.perf_counter() - load_start
+
+            # Prepare input
+            input_ids = torch.randint(0, config.vocab_size, (batch_size, seq_len), device=device)
+            positions = torch.arange(seq_len, device=device).unsqueeze(0)
+
+            # Warmup
+            for _ in range(3):
+                with torch.no_grad():
+                    _ = model(input_ids=input_ids, positions=positions)
+
+            if device_name == "mps":
+                torch.mps.synchronize()
+
+            # Benchmark
+            tokens_processed = 0
+            inf_start = time.perf_counter()
+            for _ in range(iterations):
+                with torch.no_grad():
+                    _ = model(input_ids=input_ids, positions=positions)
+                tokens_processed += batch_size * seq_len
+
+            if device_name == "mps":
+                torch.mps.synchronize()
+
+            inf_time = time.perf_counter() - inf_start
+            total_time = load_time + inf_time
+
+            results[device_name] = {
+                "load_time": load_time,
+                "inf_time": inf_time,
+                "total_time": total_time,
+                "tokens": tokens_processed,
+                "tps": tokens_processed / inf_time if inf_time > 0 else 0,
+                "tps_total": tokens_processed / total_time if total_time > 0 else 0,
+            }
+
+        print(f"\n{'='*60}")
+        print(f"[End-to-End TPS Comparison]")
+        print(f"  Model: {config.num_hidden_layers}L, hidden={config.hidden_size}, seq_len={seq_len}")
+        print(f"{'='*60}")
+        print(f"  CPU:")
+        print(f"    Model load: {results['cpu']['load_time']*1000:.2f}ms")
+        print(f"    Inference:  {results['cpu']['inf_time']*1000:.2f}ms ({results['cpu']['tps']:.0f} tok/s)")
+        print(f"    Total:      {results['cpu']['total_time']*1000:.2f}ms ({results['cpu']['tps_total']:.0f} tok/s incl. load)")
+        print(f"  MPS:")
+        print(f"    Model load: {results['mps']['load_time']*1000:.2f}ms")
+        print(f"    Inference:  {results['mps']['inf_time']*1000:.2f}ms ({results['mps']['tps']:.0f} tok/s)")
+        print(f"    Total:      {results['mps']['total_time']*1000:.2f}ms ({results['mps']['tps_total']:.0f} tok/s incl. load)")
+
+        speedup = results['cpu']['inf_time'] / results['mps']['inf_time']
+        print(f"{'='*60}")
+        print(f"  MPS Speedup (inference only): {speedup:.2f}x")
         print(f"{'='*60}")
 
 

@@ -152,11 +152,7 @@ from torch.nn import functional as F
 from transformers import AutoTokenizer
 from transformers.cache_utils import DynamicCache
 
-# Add parent to path for sdar_model import
-sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from sdar_model import SDARForCausalLM, SDARConfig
-from safetensors.torch import load_file
+from vdllm.models import SDARForCausalLM, SDARConfig
 
 
 # =============================================================================

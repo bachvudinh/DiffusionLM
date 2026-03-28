@@ -1,87 +1,82 @@
-"""
-Context Management for Block Diffusion.
+"""Global context for passing runtime information to Triton kernels.
 
-This module provides thread-local-like global context for tracking
-sequence metadata during PREFILL and DENOISE runs.
+Derived from JetEngine by Yihan Bian et al.
+Reference: https://github.com/Labman42/JetEngine
 
-Based on JetEngine's context.py:
-https://github.com/Jet-Astra/SDAR/blob/main/jetengine/utils/context.py
+Architecture Overview
+====================
 
-================================================================================
-                              USAGE
-================================================================================
+    The Context system provides a thread-global mechanism for passing
+    runtime state (PREFILL vs DENOISE, KV cache metadata) to attention
+    kernels without threading it through every function call.
 
-    from vdllm.utils import set_context, get_context
+    ┌─────────────────────────────────────────────────────────────┐
+    │                   Context Lifecycle                          │
+    │                                                              │
+    │  ModelRunner.prepare_prefill() / prepare_denoise()           │
+    │         │                                                    │
+    │         ▼                                                    │
+    │  set_context(run_type, cu_seqlens, slot_mapping, ...)        │
+    │         │                                                    │
+    │         ▼                                                    │
+    │  model.forward() → layers use get_context() internally       │
+    │    ├── BlockAttention reads run_type, cu_seqlens             │
+    │    ├── store_kvcache reads slot_mapping                      │
+    │    └── ParallelLMHead reads cu_seqlens for last-token        │
+    │         │                                                    │
+    │         ▼                                                    │
+    │  reset_context()                                             │
+    └─────────────────────────────────────────────────────────────┘
 
-    # During prefill
-    set_context(run_type="PREFILL", cu_seqlens_q=..., max_seqlen_q=1024)
-
-    # During denoise
-    set_context(run_type="DENOISE", block_length=4, is_last_denoise_step=False)
-
-    ctx = get_context()
-    print(ctx.run_type)
-
+    Context Fields:
+        run_type:     RunType.PREFILL or RunType.DENOISE
+        cu_seqlens_q: cumulative sequence lengths for queries (prefill)
+        cu_seqlens_k: cumulative sequence lengths for keys (prefill)
+        slot_mapping:  physical KV cache slot indices (prefill)
+        context_lens:  cached token counts per sequence (denoise)
+        block_tables:  physical block assignments per sequence (denoise)
+        block_length:  block size for denoising
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List
 import torch
+
+from vdllm.engine.sequence import RunType
 
 
 @dataclass
 class Context:
-    """Context for tracking sequence metadata during inference."""
-    run_type: Optional[str] = None  # "PREFILL" or "DENOISE"
-    cu_seqlens_q: Optional[torch.Tensor] = None  # Cumulative sequence lengths for Q
-    cu_seqlens_k: Optional[torch.Tensor] = None  # Cumulative sequence lengths for K
+    run_type: RunType | None = None
+    cu_seqlens_q: torch.Tensor | None = None
+    cu_seqlens_k: torch.Tensor | None = None
     max_seqlen_q: int = 0
     max_seqlen_k: int = 0
-    slot_mapping: Optional[torch.Tensor] = None  # Position to cache slot mapping
-    context_lens: Optional[torch.Tensor] = None  # Length of each context
-    block_tables: Optional[torch.Tensor] = None  # Block allocation table
+    slot_mapping: torch.Tensor | None = None
+    context_lens: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None
     is_last_denoise_step: List[bool] = field(default_factory=lambda: [False])
     block_length: int = 4
 
 
-# Global context instance
 _CONTEXT = Context()
 
 
-def get_context() -> Context:
-    """Get the current global context."""
+def get_context():
     return _CONTEXT
 
 
-def set_context(
-    run_type: Optional[str] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    cu_seqlens_k: Optional[torch.Tensor] = None,
-    max_seqlen_q: int = 0,
-    max_seqlen_k: int = 0,
-    slot_mapping: Optional[torch.Tensor] = None,
-    context_lens: Optional[torch.Tensor] = None,
-    block_tables: Optional[torch.Tensor] = None,
-    is_last_denoise_step: List[bool] = None,
-    block_length: int = 4,
-) -> None:
-    """Set the global context."""
+def set_context(run_type, cu_seqlens_q=None, cu_seqlens_k=None,
+                max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None,
+                context_lens=None, block_tables=None,
+                is_last_denoise_step=[False], block_length=4):
     global _CONTEXT
-    _CONTEXT = Context(
-        run_type=run_type,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        slot_mapping=slot_mapping,
-        context_lens=context_lens,
-        block_tables=block_tables,
-        is_last_denoise_step=is_last_denoise_step or [False],
-        block_length=block_length,
-    )
+    _CONTEXT = Context(run_type, cu_seqlens_q, cu_seqlens_k,
+                       max_seqlen_q, max_seqlen_k, slot_mapping,
+                       context_lens, block_tables,
+                       is_last_denoise_step, block_length)
 
 
-def reset_context() -> None:
-    """Reset the global context to defaults."""
+def reset_context():
     global _CONTEXT
     _CONTEXT = Context()

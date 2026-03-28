@@ -1,268 +1,252 @@
+"""Block-local attention for SDAR block diffusion models.
+
+Derived from JetEngine by Yihan Bian et al.
+Reference: https://github.com/Labman42/JetEngine
+
+Architecture Overview
+====================
+
+    Two attention modes depending on run phase:
+
+    ┌──────────────────────────────────────────────────────────────┐
+    │                  BlockAttention Forward                       │
+    │                                                              │
+    │  PREFILL (full context encoding)                             │
+    │  ┌──────────────────────────────────────────────────────┐    │
+    │  │  1. Store K,V into paged KV cache via Triton kernel  │    │
+    │  │  2. Staircase block-local attention (sparse_attn)    │    │
+    │  │                                                      │    │
+    │  │  Token layout with block_length=4:                   │    │
+    │  │    Tok:  [0  1  2  3 | 4  5  6  7 | 8  9 10 11]    │    │
+    │  │    Blk:  [  block 0  |  block 1   |  block 2  ]    │    │
+    │  │                                                      │    │
+    │  │  Attention mask (staircase, 1=attend, .=masked):     │    │
+    │  │                Q                                     │    │
+    │  │         0 1 2 3 4 5 6 7 8 9 A B                     │    │
+    │  │      0 [1 1 1 1 . . . . . . . .]                    │    │
+    │  │    K 4 [1 1 1 1 1 1 1 1 . . . .]                    │    │
+    │  │      8 [1 1 1 1 1 1 1 1 1 1 1 1]                    │    │
+    │  │                                                      │    │
+    │  └──────────────────────────────────────────────────────┘    │
+    │                                                              │
+    │  DENOISE (iterative block refinement)                        │
+    │  ┌──────────────────────────────────────────────────────┐    │
+    │  │  Q = noisy block, K/V = paged KV cache + new block   │    │
+    │  │  Non-causal attention within the block                │    │
+    │  │                                                       │    │
+    │  │  Q:  [M  tok  M  M]     (block_length=4)             │    │
+    │  │  KV: [cached context ─────────── | new block K,V]     │    │
+    │  │       ^-- paged KV cache           ^-- appended       │    │
+    │  └──────────────────────────────────────────────────────┘    │
+    │                                                              │
+    │  store_kvcache Triton Kernel                                 │
+    │  ┌──────────────────────────────────────────────────────┐    │
+    │  │  For each token i (N programs in parallel):           │    │
+    │  │    slot = slot_mapping[i]                              │    │
+    │  │    k_cache[slot, :] = key[i, :]    (D values)         │    │
+    │  │    v_cache[slot, :] = value[i, :]  (D values)         │    │
+    │  └──────────────────────────────────────────────────────┘    │
+    └──────────────────────────────────────────────────────────────┘
+
+
+Prefill Forward — Tensor Flow
+==============================
+
+    Example: batch=2 seqs, seq_lens=[12, 8], num_heads=32, num_kv_heads=8,
+             head_dim=128, block_length=4, dtype=bfloat16
+
+    q: (20, 4096) float16         ← total_tokens=12+8=20, 32*128=4096
+    k: (20, 1024) float16         ← 8*128=1024
+    v: (20, 1024) float16
+                │
+                ▼  view
+    q: (20, 32, 128) float16
+    k: (20, 8, 128)  float16
+    v: (20, 8, 128)  float16
+                │
+                ├──► store_kvcache(k, v, k_cache, v_cache, slot_mapping)
+                │       k_cache: (num_blocks, block_size, 8, 128) float16
+                │       slot_mapping: (20,) int32
+                │
+                └──► sparse_attn_varlen(q, k, v,
+                        cu_seqlens_q=[0, 12, 20],      (3,) int32
+                        cu_seqlens_k=[0, 12, 20],
+                        staircase_size=4)
+                            │
+                            ▼
+                    o: (20, 32, 128) float16
+                            │
+                            ▼  view
+                    output: (20, 4096) float16
+
+
+Denoise Forward — Tensor Flow
+==============================
+
+    Example: batch=3 seqs, block_length=4, cached_lens=[24, 16, 32]
+
+    q: (12, 4096) float16         ← 3*4=12 tokens
+    k: (12, 1024) float16
+    v: (12, 1024) float16
+                │
+                ▼  view → (3, 4, 32, 128), (3, 4, 8, 128), (3, 4, 8, 128)
+                │
+                └──► flash_attn_with_kvcache(
+                        q,                         (3, 4, 32, 128) float16
+                        k_cache=k_cache,           (num_blocks, block_size, 8, 128)
+                        v_cache=v_cache,           same shape
+                        k=k, v=v,                  (3, 4, 8, 128) — appended
+                        cache_seqlens=[24,16,32],  (3,) int32
+                        block_table=block_tables,  (3, max_blocks) int32
+                        causal=False)
+                            │
+                            ▼
+                    o: (3, 4, 32, 128) float16
+                            │
+                            ▼  view
+                    output: (12, 4096) float16
 """
-SDAR Attention - Multi-head Attention with GQA.
-
-This module provides the attention mechanism for SDAR models, including
-support for Grouped Query Attention (GQA) and rotary position embeddings.
-
-Based on JetEngine's attention implementation:
-https://github.com/Jet-Astra/SDAR/blob/main/jetengine/layers/attention.py
-
-================================================================================
-                              GROUPED QUERY ATTENTION
-================================================================================
-
-GQA uses fewer key/value heads than query heads:
-- num_query_heads: 32 (for example)
-- num_kv_heads: 8 (for example)
-- num_groups: 32 / 8 = 4
-
-Each KV head is shared by multiple Q heads, reducing computation.
-
-================================================================================
-                              USAGE
-================================================================================
-
-    from sdar_model.layers import SDARAttention
-
-    attn = SDARAttention(
-        hidden_size=4096,
-        num_heads=32,
-        num_kv_heads=8,
-        head_dim=128,
-    )
-    output = attn(positions, hidden_states)
-
-"""
-
-import math
-from typing import Optional, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
+import triton
+import triton.language as tl
 
-from .rmsnorm import RMSNorm
-from .rotary import apply_rotary_pos_emb
+from vdllm.utils.context import get_context
+from vdllm.engine.sequence import RunType
+from vdllm.kernels.triton.attention import sparse_attn_varlen
+from flash_attn import flash_attn_with_kvcache
 
 
-def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+@triton.jit
+def store_kvcache_kernel(
+    key_ptr,
+    key_stride,
+    value_ptr,
+    value_stride,
+    k_cache_ptr,
+    v_cache_ptr,
+    slot_mapping_ptr,
+    D: tl.constexpr,
+):
+    """Triton kernel: scatter K,V vectors into paged cache slots.
+
+    Input:
+        key_ptr:          pointer to key tensor (N, num_heads * head_dim)
+        value_ptr:        pointer to value tensor (N, num_heads * head_dim)
+        k_cache_ptr:      pointer to key cache (num_blocks * block_size, D)
+        v_cache_ptr:      pointer to value cache (same shape)
+        slot_mapping_ptr: pointer to slot indices (N,)
+        D:                num_heads * head_dim (compile-time constant)
+
+    Output:
+        k_cache and v_cache updated in-place at mapped slots
     """
-    Repeat key/value heads to match query heads for GQA.
+    idx = tl.program_id(0)
+    key_offsets = idx * key_stride + tl.arange(0, D)
+    value_offsets = idx * value_stride + tl.arange(0, D)
+    key = tl.load(key_ptr + key_offsets)
+    value = tl.load(value_ptr + value_offsets)
+    slot = tl.load(slot_mapping_ptr + idx)
+    cache_offsets = slot * D + tl.arange(0, D)
+    tl.store(k_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
-    Args:
-        hidden_states: Input tensor [batch, num_kv_heads, seq_len, head_dim]
-        n_rep: Number of repetitions (num_q_heads // num_kv_heads)
 
-    Returns:
-        Repeated tensor [batch, num_q_heads, seq_len, head_dim]
+def store_kvcache(key: torch.Tensor, value: torch.Tensor,
+                  k_cache: torch.Tensor, v_cache: torch.Tensor,
+                  slot_mapping: torch.Tensor):
+    """Scatter key/value vectors into paged KV cache.
+
+    Input:
+        key:          (N, num_heads, head_dim) — key vectors
+        value:        (N, num_heads, head_dim) — value vectors
+        k_cache:      (num_blocks * block_size, num_heads * head_dim)
+        v_cache:      same shape as k_cache
+        slot_mapping: (N,) int32 — physical slot index for each token
+
+    Output:
+        k_cache, v_cache updated in-place
     """
-    if n_rep == 1:
-        return hidden_states
-
-    batch, num_kv_heads, seq_len, head_dim = hidden_states.shape
-    hidden_states = hidden_states[:, :, None, :, :].expand(
-        batch, num_kv_heads, n_rep, seq_len, head_dim
-    )
-    return hidden_states.reshape(batch, num_kv_heads * n_rep, seq_len, head_dim)
-
-
-class SDARAttention(nn.Module):
-    """
-    Multi-head attention with GQA support and RoPE.
-
-    This attention module implements:
-    - Grouped Query Attention (GQA) for memory efficiency
-    - Rotary Position Embeddings (RoPE)
-    - RMSNorm for Q/K normalization
-
-    Attributes:
-        num_heads: Number of query attention heads
-        num_kv_heads: Number of key/value attention heads
-        head_dim: Dimension of each attention head
-        scaling: Attention scale factor
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: int,
-        head_dim: Optional[int] = None,
-        rope_theta: float = 10000.0,
-        rope_scaling: Optional[dict] = None,
-        rms_norm_eps: float = 1e-6,
-        bias: bool = False,
-        device: Optional[torch.device] = None,
-    ):
-        """
-        Initialize SDAR attention.
-
-        Args:
-            hidden_size: Hidden dimension size
-            num_heads: Number of query attention heads
-            num_kv_heads: Number of key/value attention heads
-            head_dim: Dimension per head (defaults to hidden_size // num_heads)
-            rope_theta: RoPE base period
-            rope_scaling: Optional RoPE scaling config
-            rms_norm_eps: RMSNorm epsilon
-            bias: Whether to use bias in QKV projection
-            device: Device for layer creation
-        """
-        super().__init__()
-
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim or (hidden_size // num_heads)
-        self.scaling = self.head_dim ** -0.5
-
-        assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
-        self.num_groups = num_heads // num_kv_heads
-
-        # Q/K/V projections
-        self.q_proj = nn.Linear(hidden_size, num_heads * self.head_dim, bias=bias, device=device)
-        self.k_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=bias, device=device)
-        self.v_proj = nn.Linear(hidden_size, num_kv_heads * self.head_dim, bias=bias, device=device)
-        self.o_proj = nn.Linear(num_heads * self.head_dim, hidden_size, bias=False, device=device)
-
-        # Q/K RMSNorm (per-head normalization before RoPE)
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-
-        # RoPE is applied in the forward pass using the rotary module
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        store_kv: bool = True,
-    ) -> torch.Tensor:
-        """
-        Forward pass for SDAR attention.
-
-        Args:
-            positions: Position indices [batch_size, seq_len]
-            hidden_states: Input hidden states [batch_size, seq_len, hidden_size]
-            attention_mask: Optional attention mask
-            store_kv: Whether to store KV for cache (not used in this implementation)
-
-        Returns:
-            Attention output [batch_size, seq_len, hidden_size]
-        """
-        batch_size, seq_len, _ = hidden_states.shape
-
-        # Q/K/V projection
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-
-        # Reshape for multi-head attention
-        # [batch, seq, hidden] -> [batch, seq, num_heads, head_dim]
-        q = q.view(batch_size, seq_len, self.num_heads, self.head_dim)
-        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
-
-        # Apply Q/K RMSNorm
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        # Apply RoPE
-        q, k = apply_rotary_pos_emb(q, k, None, positions)
-
-        # Transpose for attention: [batch, num_heads, seq, head_dim]
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Repeat KV heads for GQA
-        k = repeat_kv(k, self.num_groups)
-        v = repeat_kv(v, self.num_groups)
-
-        # Attention mask handling
-        if attention_mask is not None:
-            # Expand mask for SDPA: [..., seq, seq] -> [..., 1, seq, seq]
-            if attention_mask.dim() == 2:
-                attention_mask = attention_mask.unsqueeze(0).unsqueeze(0)
-            elif attention_mask.dim() == 3:
-                attention_mask = attention_mask.unsqueeze(1)
-
-        # Compute attention with SDPA
-        output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attention_mask,
-            is_causal=False,
-            scale=self.scaling,
-        )
-
-        # Reshape output: [batch, num_heads, seq, head_dim] -> [batch, seq, hidden_size]
-        output = output.transpose(1, 2).contiguous()
-        output = output.view(batch_size, seq_len, self.num_heads * self.head_dim)
-
-        # Output projection
-        output = self.o_proj(output)
-
-        return output
+    N, num_heads, head_dim = key.shape
+    D = num_heads * head_dim
+    assert key.stride(-1) == 1 and value.stride(-1) == 1
+    assert key.stride(1) == head_dim and value.stride(1) == head_dim
+    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert slot_mapping.numel() == N
+    store_kvcache_kernel[(N,)](
+        key, key.stride(0), value, value.stride(0),
+        k_cache, v_cache, slot_mapping, D)
 
 
 class Attention(nn.Module):
+    """Base attention module with KV cache placeholders.
+
+    Input:
+        num_heads:    int — number of query heads (after TP split)
+        head_dim:     int — dimension per head
+        scale:        float — attention scale factor (1/sqrt(head_dim))
+        num_kv_heads: int — number of KV heads (GQA support)
     """
-    Simplified attention module for SDAR.
 
-    This is a wrapper around SDARAttention that provides a simpler interface.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        num_heads: int,
-        num_kv_heads: Optional[int] = None,
-        head_dim: Optional[int] = None,
-        rope_theta: float = 10000.0,
-        rms_norm_eps: float = 1e-6,
-        device: Optional[torch.device] = None,
-    ):
-        """
-        Initialize Attention.
-
-        Args:
-            hidden_size: Hidden dimension size
-            num_heads: Number of attention heads
-            num_kv_heads: Number of KV heads (defaults to num_heads for MHA)
-            head_dim: Dimension per head
-            rope_theta: RoPE base period
-            rms_norm_eps: RMSNorm epsilon
-            device: Device for layer creation
-        """
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
         super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = scale
+        self.num_kv_heads = num_kv_heads
+        self.k_cache = self.v_cache = torch.tensor([])
 
-        num_kv_heads = num_kv_heads or num_heads
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        pass
 
-        self.attn = SDARAttention(
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            rope_theta=rope_theta,
-            rms_norm_eps=rms_norm_eps,
-            device=device,
-        )
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Forward pass.
+class BlockAttention(Attention):
+    """SDAR block-local attention with staircase prefill and paged denoise.
 
-        Args:
-            positions: Position indices
-            hidden_states: Input hidden states
-            attention_mask: Optional attention mask
+    Input:
+        q: (total_tokens, num_heads * head_dim) — query vectors
+        k: (total_tokens, num_kv_heads * head_dim) — key vectors
+        v: (total_tokens, num_kv_heads * head_dim) — value vectors
 
-        Returns:
-            Attention output
-        """
-        return self.attn(positions, hidden_states, attention_mask)
+    Output:
+        (total_tokens, num_heads * head_dim) — attention output
+
+    Behavior:
+        PREFILL: stores KV to cache, uses staircase sparse attention
+        DENOISE: reshapes to (batch, block_length, ...), uses FlashAttention
+                 with paged KV cache (non-causal within block)
+    """
+
+    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
+        super().__init__(num_heads, head_dim, scale, num_kv_heads)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        o: torch.Tensor
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        v = v.view(-1, self.num_kv_heads, self.head_dim)
+        context = get_context()
+        k_cache, v_cache = self.k_cache, self.v_cache
+
+        should_store_whole = (context.run_type == RunType.PREFILL)
+        if should_store_whole and k_cache.numel() and v_cache.numel():
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
+        if context.run_type == RunType.PREFILL:
+            o = sparse_attn_varlen(
+                q, k, v,
+                cu_seqlens_q=context.cu_seqlens_q,
+                cu_seqlens_k=context.cu_seqlens_k,
+                staircase_size=context.block_length)
+        else:
+            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
+            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+            o = flash_attn_with_kvcache(
+                q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                cache_seqlens=context.context_lens,
+                block_table=context.block_tables,
+                causal=False)
+        o = o.view(-1, self.num_heads * self.head_dim)
+        return o
