@@ -54,7 +54,7 @@ class SDARAttention(nn.Module):
             base=args.rope_theta,
         )
 
-    def __call__(self, x, mask=None, cache=None):
+    def __call__(self, x, mask=None, cache=None, position_ids=None, store_kv=True):
         B, L, _ = x.shape
 
         q = self.q_proj(x)
@@ -72,13 +72,26 @@ class SDARAttention(nn.Module):
         k = k.transpose(0, 2, 1, 3)
         v = v.transpose(0, 2, 1, 3)
 
-        if cache is not None:
-            q = self.rope(q, offset=cache.offset)
-            k = self.rope(k, offset=cache.offset)
-            k, v = cache.update_and_fetch(k, v)
+        # Determine RoPE offset
+        if position_ids is not None:
+            # Use the starting position from position_ids for RoPE offset.
+            # This works because within a block, positions are contiguous.
+            offset = position_ids[0, 0].item()
+        elif cache is not None:
+            offset = cache.offset
         else:
-            q = self.rope(q)
-            k = self.rope(k)
+            offset = 0
+
+        q = self.rope(q, offset=offset)
+        k = self.rope(k, offset=offset)
+
+        if cache is not None:
+            if store_kv:
+                # Prefill / commit: update cache with new K, V
+                k, v = cache.update_and_fetch(k, v)
+            else:
+                # Denoise: read cached K, V and concatenate, but do NOT update cache
+                k, v = cache.fetch_and_concat(k, v)
 
         if self.n_rep > 1:
             k = mx.repeat(k, self.n_rep, axis=1)
@@ -109,7 +122,7 @@ class SDARMLP(nn.Module):
 
 
 class KVCache:
-    """Simple KV cache for autoregressive generation."""
+    """KV cache supporting both store (prefill) and read-only (denoise) modes."""
 
     def __init__(self):
         self._k = None
@@ -121,6 +134,7 @@ class KVCache:
         return self._offset
 
     def update_and_fetch(self, k, v):
+        """Store new K, V into cache and return full K, V (prefill mode)."""
         if self._k is None:
             self._k = k
             self._v = v
@@ -129,6 +143,14 @@ class KVCache:
             self._v = mx.concatenate([self._v, v], axis=2)
         self._offset += k.shape[2]
         return self._k, self._v
+
+    def fetch_and_concat(self, k, v):
+        """Concatenate cached K, V with current K, V without updating cache (denoise mode)."""
+        if self._k is None:
+            return k, v
+        full_k = mx.concatenate([self._k, k], axis=2)
+        full_v = mx.concatenate([self._v, v], axis=2)
+        return full_k, full_v
 
 
 class SDARDecoderLayer(nn.Module):
@@ -141,8 +163,12 @@ class SDARDecoderLayer(nn.Module):
         self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, x, mask=None, cache=None):
-        r = self.self_attn(self.input_layernorm(x), mask=mask, cache=cache)
+    def __call__(self, x, mask=None, cache=None, position_ids=None, store_kv=True):
+        r = self.self_attn(
+            self.input_layernorm(x),
+            mask=mask, cache=cache,
+            position_ids=position_ids, store_kv=store_kv,
+        )
         h = x + r
         r = self.mlp(self.post_attention_layernorm(h))
         return h + r
@@ -158,12 +184,13 @@ class SDARModel(nn.Module):
         self.layers = [SDARDecoderLayer(args) for _ in range(args.num_hidden_layers)]
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
-    def __call__(self, inputs, cache=None, mask=None):
+    def __call__(self, inputs, cache=None, mask=None, position_ids=None, store_kv=True):
         h = self.embed_tokens(inputs)
         if cache is None:
             cache = [None] * len(self.layers)
         for i, layer in enumerate(self.layers):
-            h = layer(h, mask=mask, cache=cache[i])
+            h = layer(h, mask=mask, cache=cache[i],
+                      position_ids=position_ids, store_kv=store_kv)
         return self.norm(h)
 
 
@@ -179,8 +206,9 @@ class SDARForCausalLM(nn.Module):
         else:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
 
-    def __call__(self, inputs, cache=None, mask=None):
-        h = self.model(inputs, cache=cache, mask=mask)
+    def __call__(self, inputs, cache=None, mask=None, position_ids=None, store_kv=True):
+        h = self.model(inputs, cache=cache, mask=mask,
+                       position_ids=position_ids, store_kv=store_kv)
         if self.lm_head is not None:
             return self.lm_head(h)
         return self.model.embed_tokens.as_linear(h)
