@@ -116,6 +116,7 @@ from vdllm.utils.context import get_context
 from vdllm.engine.sequence import RunType
 from vdllm.kernels.triton.attention import sparse_attn_varlen
 from flash_attn import flash_attn_with_kvcache
+from vdllm.backends.base import AttentionBackend
 
 
 @triton.jit
@@ -216,10 +217,22 @@ class BlockAttention(Attention):
         PREFILL: stores KV to cache, uses staircase sparse attention
         DENOISE: reshapes to (batch, block_length, ...), uses FlashAttention
                  with paged KV cache (non-causal within block)
+
+    Backend Dispatch:
+        When backend is set, delegates to AttentionBackend protocol.
+        Otherwise uses direct Triton/FlashInfer kernels (legacy mode).
     """
 
-    def __init__(self, num_heads, head_dim, scale, num_kv_heads):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        scale: float,
+        num_kv_heads: int,
+        backend: AttentionBackend | None = None,
+    ):
         super().__init__(num_heads, head_dim, scale, num_kv_heads)
+        self.backend = backend
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
@@ -231,22 +244,45 @@ class BlockAttention(Attention):
 
         should_store_whole = (context.run_type == RunType.PREFILL)
         if should_store_whole and k_cache.numel() and v_cache.numel():
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+            if self.backend is not None:
+                self.backend.reshape_and_cache(
+                    k.view(-1, self.num_kv_heads * self.head_dim),
+                    v.view(-1, self.num_kv_heads * self.head_dim),
+                    k_cache, v_cache, context.slot_mapping)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
 
         if context.run_type == RunType.PREFILL:
-            o = sparse_attn_varlen(
-                q, k, v,
-                cu_seqlens_q=context.cu_seqlens_q,
-                cu_seqlens_k=context.cu_seqlens_k,
-                staircase_size=context.block_length)
+            if self.backend is not None:
+                o = self.backend.prefill_attention(
+                    q.view(-1, self.num_heads * self.head_dim),
+                    k.view(-1, self.num_kv_heads * self.head_dim),
+                    v.view(-1, self.num_kv_heads * self.head_dim),
+                    block_length=context.block_length,
+                    staircase=True)
+            else:
+                o = sparse_attn_varlen(
+                    q, k, v,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    staircase_size=context.block_length)
         else:
-            q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
-            k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
-            v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
-            o = flash_attn_with_kvcache(
-                q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
-                cache_seqlens=context.context_lens,
-                block_table=context.block_tables,
-                causal=False)
+            if self.backend is not None:
+                o = self.backend.denoise_attention(
+                    q.view(-1, self.num_heads * self.head_dim),
+                    k_cache, v_cache,
+                    k.view(-1, self.num_kv_heads * self.head_dim),
+                    v.view(-1, self.num_kv_heads * self.head_dim),
+                    block_tables=context.block_tables,
+                    seq_lens=context.context_lens)
+            else:
+                q = q.view(-1, context.block_length, self.num_heads, self.head_dim)
+                k = k.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+                v = v.view(-1, context.block_length, self.num_kv_heads, self.head_dim)
+                o = flash_attn_with_kvcache(
+                    q, k_cache=k_cache, v_cache=v_cache, k=k, v=v,
+                    cache_seqlens=context.context_lens,
+                    block_table=context.block_tables,
+                    causal=False)
         o = o.view(-1, self.num_heads * self.head_dim)
         return o
