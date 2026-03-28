@@ -24,7 +24,13 @@ Quick Start:
     outputs = llm.generate(["Hello, world!"], params)
 """
 
-from vdllm.llm import LLM
-from vdllm.sampling_params import SamplingParams
+def __getattr__(name):
+    if name == "LLM":
+        from vdllm.llm import LLM
+        return LLM
+    if name == "SamplingParams":
+        from vdllm.sampling_params import SamplingParams
+        return SamplingParams
+    raise AttributeError(f"module 'vdllm' has no attribute {name!r}")
 
 __all__ = ["LLM", "SamplingParams"]
