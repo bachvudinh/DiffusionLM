@@ -36,11 +36,15 @@ Run `python example.py --help` for all options.
 ## Install
 
 ```bash
-pip install -e .
-```
+# Apple Silicon (MLX)
+pip install -e ".[metal]"
 
-**CUDA** requires PyTorch with CUDA, FlashInfer, and Triton.
-**MLX** requires `mlx` (Apple Silicon only).
+# NVIDIA GPU (CUDA)
+pip install -e ".[cuda]"
+
+# Development (both backends + pytest)
+pip install -e ".[dev]"
+```
 
 ## How It Works
 

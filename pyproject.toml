@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vdllm"
+version = "0.1.0"
+description = "Inference engine for block diffusion language models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [{name = "Bach Vu"}]
+
+dependencies = [
+    "transformers>=4.40",
+    "numpy>=1.24",
+    "tqdm",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+metal = [
+    "mlx>=0.18",
+]
+cuda = [
+    "torch>=2.2",
+    "triton>=3.0",
+    "flash-attn>=2.5",
+    "flashinfer>=0.1",
+    "accelerate>=0.30",
+    "liger-kernel>=0.2",
+]
+dev = [
+    "pytest>=8.0",
+    "torch>=2.2",
+    "mlx>=0.18",
+]
+
+[project.urls]
+Repository = "https://github.com/bachvudinh/DiffusionLM"
+
+[tool.setuptools.packages.find]
+include = ["vdllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
