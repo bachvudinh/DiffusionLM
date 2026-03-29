@@ -2,14 +2,12 @@
 
 Inference engine for block diffusion language models. Supports CUDA and Apple Silicon (MLX).
 
-Based on [JetEngine](https://github.com/Labman42/JetEngine) by Yihan Bian et al.
-
 ## Quick Start
 
 ```python
 from vdllm import LLM, SamplingParams
 
-llm = LLM("path/to/sdar-model")
+llm = LLM("path/to/model")
 
 params = SamplingParams(
     max_tokens=256,
@@ -123,13 +121,17 @@ python -m pytest tests/unit/ -v                          # Backend unit tests
 
 - [JetLM/SDAR-1.7B-Chat](https://huggingface.co/JetLM/SDAR-1.7B-Chat)
 
+## References
+- The codebase is based on [JetEngine](https://github.com/Labman42/JetEngine) by Yihan Bian et al.
+- Speical thanks to [vllm-metal](https://github.com/vllm-project/vllm-metal) and [mlx-lm](https://github.com/ml-explore/mlx-lm) for insights on Apple Silicon optimization.
+
 ## Citation
 
 ```bibtex
 @misc{jetengine2025,
-    title={JetEngine: Inference Engine for Block Diffusion Language Models},
-    author={Yihan Bian et al.},
-    year={2025},
-    url={https://github.com/Labman42/JetEngine}
+    title={vdllm: Block Diffusion Language Models Inference Engine},
+    author={Bach Vu},
+    year={2026},
+    url={https://github.com/bachvudinh/DiffusionLM}
 }
 ```
