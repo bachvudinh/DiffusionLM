@@ -181,6 +181,7 @@ class MLXEngine:
             "trajectory": [],
             "logprobs": [],
             "entropies": [],
+            "timing": timing,
         }
 
     def is_finished(self):

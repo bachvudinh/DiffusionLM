@@ -1,6 +1,20 @@
 """Sampling utilities for block diffusion generation in MLX."""
 
+from functools import partial
+
 import mlx.core as mx
+
+
+# Compiled categorical sampling — fuses random draw + softmax + gather into
+# one Metal kernel.  Random state is declared so mx.compile tracks the PRNG
+# properly (same pattern as mlx-lm's sample_utils.py).
+@partial(mx.compile, inputs=mx.random.state, outputs=mx.random.state)
+def _compiled_sample(logits: mx.array) -> tuple:
+    """Sample tokens and extract their probabilities (compiled)."""
+    tokens = mx.random.categorical(logits)
+    probs = mx.softmax(logits, axis=-1)
+    token_probs = mx.take_along_axis(probs, tokens[:, None], axis=-1).squeeze(-1)
+    return tokens, token_probs
 
 
 def top_k_logits(logits: mx.array, k: int) -> mx.array:
@@ -33,12 +47,6 @@ def top_p_logits(logits: mx.array, p: float) -> mx.array:
     )
 
     # Scatter the mask back to original positions
-    # We need to "unsort" the mask. Create an inverse permutation.
-    # For each position in the original array, find where it ended up in the sorted array.
-    batch_shape = logits.shape[:-1]
-    vocab_size = logits.shape[-1]
-
-    # Use argsort of sorted_indices to get the inverse permutation
     inverse_indices = mx.argsort(sorted_indices, axis=-1)
     mask_original = mx.take_along_axis(sorted_mask, inverse_indices, axis=-1)
 
@@ -77,11 +85,7 @@ def sample_with_temperature_topk_topp(
     if top_p < 1.0:
         logits = top_p_logits(logits, top_p)
 
-    # Sample using categorical (takes logits directly)
-    tokens = mx.random.categorical(logits)  # shape: (N,)
-
-    # Compute probabilities to get confidence scores
-    probs = mx.softmax(logits, axis=-1)
-    token_probs = mx.take_along_axis(probs, tokens[:, None], axis=-1).squeeze(-1)
+    # Use compiled sampling (fused random + softmax + gather)
+    tokens, token_probs = _compiled_sample(logits)
 
     return tokens.reshape(orig_shape), token_probs.reshape(orig_shape)
