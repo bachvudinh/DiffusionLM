@@ -1,109 +1,109 @@
-#!/usr/bin/env python3
-"""
-Example script: Run SDAR model with MLX on Apple Silicon
+"""Block diffusion generation using vdllm.
+
+Works on both CUDA (NVIDIA GPU) and Apple Silicon (MLX).
+Auto-detects hardware and uses the appropriate backend.
 
 Usage:
-    python example.py "Your prompt here"
-    python example.py "The capital of France is" --gen-length 50
+    python example.py "What is the capital of France?"
+    python example.py "Write a Python function" --chat --gen-length 512
+    python example.py "Hello" --backend mlx --temperature 0.7
 """
 
-import sys
 import argparse
-import time
-from pathlib import Path
 
-MODEL_PATH = Path("/tmp/sdar-1.7b-chat")
-
-
-def load_model():
-    """Load MLX SDAR model and tokenizer."""
-    import mlx.core as mx
-    from vdllm.models.mlx_sdar import SDARForCausalLM, SDARModelArgs, KVCache
-    import json
-
-    with open(MODEL_PATH / "config.json") as f:
-        config = json.load(f)
-
-    args = SDARModelArgs.from_dict(config)
-    model = SDARForCausalLM(args)
-
-    weights = {}
-    for wf in sorted(MODEL_PATH.glob("*.safetensors")):
-        weights.update(mx.load(str(wf)))
-    weights = model.sanitize(weights)
-    model.load_weights(list(weights.items()), strict=False)
-    mx.eval(model.parameters())
-
-    import os
-    os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["_attn_implementation"] = "eager"
-
-    import types
-    sys.modules["flash_attn"] = types.ModuleType("flash_attn")
-    sys.modules["flash_attn"].__spec__ = type("Spec", (), {"name": "flash_attn"})()
-    sys.modules["fused_linear_diffusion_cross_entropy"] = types.ModuleType("fused_linear_diffusion_cross_entropy")
-    sys.modules["fused_linear_diffusion_cross_entropy"].__spec__ = type("Spec", (), {"name": "fused_linear_diffusion_cross_entropy"})()
-
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH), trust_remote_code=True)
-
-    return model, tokenizer
-
-
-def generate(model, tokenizer, prompt: str, gen_length: int = 50):
-    """Generate text from prompt using MLX model."""
-    import mlx.core as mx
-    from vdllm.models.mlx_sdar import KVCache
-
-    print(f"\nPrompt: \"{prompt}\"")
-    print("-" * 50)
-
-    input_ids = tokenizer.encode(prompt)
-    input_mlx = mx.array([input_ids])
-
-    caches = [KVCache() for _ in range(28)]
-
-    start = time.perf_counter()
-    logits = model(input_mlx, cache=caches)
-    mx.eval(logits)
-    prefill_time = (time.perf_counter() - start) * 1000
-
-    generated = input_ids[:]
-    gen_start = time.perf_counter()
-
-    for _ in range(gen_length):
-        next_token = int(mx.argmax(logits[:, -1]).item())
-        generated.append(next_token)
-        logits = model(mx.array([[next_token]]), cache=caches)
-        mx.eval(logits)
-
-    gen_time = (time.perf_counter() - gen_start) * 1000
-
-    output = tokenizer.decode(generated)
-    continuation = tokenizer.decode(generated[len(input_ids):])
-
-    print(f"Prefill: {prefill_time:.0f} ms ({len(input_ids)} tokens)")
-    print(f"Generated {gen_length} tokens in {gen_time:.0f} ms")
-    print(f"Speed: {gen_length / (gen_time / 1000):.1f} tokens/sec")
-    print()
-    print(f"Output: \"{output}\"")
-    print()
-    print(f"Continuation: \"{continuation[:100]}{'...' if len(continuation) > 100 else ''}\"")
-
-    return output
+from vdllm import LLM, SamplingParams
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run SDAR model with MLX")
-    parser.add_argument("prompt", help="Prompt text")
-    parser.add_argument("--gen-length", type=int, default=50, help="Number of tokens to generate")
+    parser = argparse.ArgumentParser(
+        description="Block Diffusion Generation with vdllm")
+    parser.add_argument("prompt", type=str, help="Input prompt text")
+    parser.add_argument(
+        "--model-path", type=str, default="/tmp/sdar-1.7b-chat",
+        help="Path to SDAR model directory")
+    parser.add_argument(
+        "--backend", type=str, default="auto",
+        choices=["auto", "cuda", "mlx", "mps", "cpu"],
+        help="Backend to use (default: auto-detect)")
+    parser.add_argument(
+        "--mask-id", type=int, default=-1,
+        help="Mask token id (-1 for auto-detect from tokenizer)")
+    parser.add_argument(
+        "--gen-length", type=int, default=256,
+        help="Maximum generation length in tokens")
+    parser.add_argument(
+        "--block-length", type=int, default=4,
+        help="Length of token block to replace each denoising step")
+    parser.add_argument(
+        "--denoising-steps", type=int, default=4,
+        help="Number of denoising steps per block")
+    parser.add_argument(
+        "--temperature", type=float, default=1.0,
+        help="Sampling temperature")
+    parser.add_argument(
+        "--top-k", type=int, default=0,
+        help="Top-K sampling (0 to disable)")
+    parser.add_argument(
+        "--top-p", type=float, default=1.0,
+        help="Top-P sampling threshold (1.0 to disable)")
+    parser.add_argument(
+        "--remasking-strategy", type=str, default="low_confidence_dynamic",
+        choices=["low_confidence_dynamic", "low_confidence_static",
+                 "sequential", "entropy_bounded", "random"],
+        help="Strategy for remasking tokens")
+    parser.add_argument(
+        "--confidence-threshold", type=float, default=0.85,
+        help="Confidence threshold for low-confidence remasking")
+    parser.add_argument(
+        "--eb-threshold", type=float, default=0.35,
+        help="Entropy threshold for entropy bounded sampling")
+    parser.add_argument(
+        "--chat", action="store_true",
+        help="Use chat template formatting")
     args = parser.parse_args()
 
-    print("Loading model...")
-    model, tokenizer = load_model()
-    print("Model loaded.")
+    # Initialize LLM (auto-detects backend)
+    llm = LLM(
+        args.model_path,
+        backend=args.backend,
+        mask_token_id=args.mask_id,
+    )
 
-    generate(model, tokenizer, args.prompt, args.gen_length)
+    # Prepare prompt
+    if args.chat:
+        messages = [{"role": "user", "content": args.prompt}]
+        prompt_text = llm.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+    else:
+        prompt_text = args.prompt
+
+    # Build sampling params
+    params = SamplingParams(
+        max_tokens=args.gen_length,
+        block_length=args.block_length,
+        denoising_steps=args.denoising_steps,
+        temperature=args.temperature,
+        topk=args.top_k,
+        topp=args.top_p,
+        remasking_strategy=args.remasking_strategy,
+        dynamic_threshold=args.confidence_threshold,
+        eb_threshold=args.eb_threshold,
+    )
+
+    print(f"\nPrompt: {args.prompt}")
+    print(f"Config: gen_length={args.gen_length}, block_length={args.block_length}, "
+          f"steps={args.denoising_steps}")
+    print(f"Sampling: temp={args.temperature}, top_k={args.top_k}, "
+          f"top_p={args.top_p}")
+    print(f"Strategy: {args.remasking_strategy}")
+    print()
+
+    # Generate
+    outputs = llm.generate([prompt_text], params, use_tqdm=False)
+
+    print(f"{'=' * 60}")
+    print(f"Output:\n{outputs[0]['text']}")
+    print(f"{'=' * 60}")
 
 
 if __name__ == "__main__":

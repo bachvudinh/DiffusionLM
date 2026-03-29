@@ -1,19 +1,7 @@
-"""vdllm — Block Diffusion Language Model inference engine.
+"""vdllm -- Block Diffusion Language Model inference engine.
 
-Derived from JetEngine by Yihan Bian et al.
-Reference: https://github.com/Labman42/JetEngine
-
-A high-performance inference engine for SDAR and SDAR-MoE block
-diffusion language models. Features include:
-
-  - Paged KV cache with prefix caching (xxhash)
-  - Staircase block-local attention (Triton kernel)
-  - FlashAttention-2 for paged denoise attention
-  - CUDA graph capture/replay for denoise steps
-  - Tensor parallelism (TP) for multi-GPU inference
-  - 5 remasking strategies: sequential, low_confidence_static,
-    low_confidence_dynamic, entropy_bounded, random
-  - Fused MoE Triton kernel for sparse expert models
+Supports CUDA (NVIDIA GPU) and MLX (Apple Silicon) backends.
+Auto-detects hardware and dispatches to the appropriate engine.
 
 Quick Start:
 
@@ -22,7 +10,10 @@ Quick Start:
     llm = LLM("path/to/sdar-model")
     params = SamplingParams(max_tokens=256, temperature=0.7)
     outputs = llm.generate(["Hello, world!"], params)
+    for out in outputs:
+        print(out["text"])
 """
+
 
 def __getattr__(name):
     if name == "LLM":
@@ -31,6 +22,10 @@ def __getattr__(name):
     if name == "SamplingParams":
         from vdllm.sampling_params import SamplingParams
         return SamplingParams
+    if name == "Config":
+        from vdllm.config import Config
+        return Config
     raise AttributeError(f"module 'vdllm' has no attribute {name!r}")
 
-__all__ = ["LLM", "SamplingParams"]
+
+__all__ = ["LLM", "SamplingParams", "Config"]
